@@ -66,7 +66,7 @@ export function setSessionCookie(
   res.cookie(SESSION_COOKIE_NAME, token, {
     httpOnly: true,
     sameSite: "lax",
-    secure: config.isProduction,
+    secure: config.isProduction && process.env.COOKIE_SECURE !== "0",
     path: "/",
     maxAge: Math.max(0, expiresAt - Date.now()),
   });
@@ -76,7 +76,7 @@ export function clearSessionCookie(res: Response, config: AppConfig): void {
   res.clearCookie(SESSION_COOKIE_NAME, {
     httpOnly: true,
     sameSite: "lax",
-    secure: config.isProduction,
+    secure: config.isProduction && process.env.COOKIE_SECURE !== "0",
     path: "/",
   });
 }

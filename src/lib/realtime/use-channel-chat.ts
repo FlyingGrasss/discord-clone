@@ -3,6 +3,9 @@
 import { MESSAGE_MAX_LENGTH } from "@shared/constants";
 import {
   WS_TYPING_THROTTLE_MS,
+  type CallServerMessage,
+  type ClientMessage,
+  type ErrorPayload,
   type ReactionEmoji,
   type ReactionGroup,
   type TypingEventPayload,
@@ -47,6 +50,10 @@ export interface UseChannelChatOptions {
   firstChannelHref: string;
   /** Called when a send fails so the composer can restore the draft text. */
   onSendFailed?: (failure: SendFailure) => void;
+  /** Voice-call signaling events carried by the same socket. */
+  onCallEvent?: (message: CallServerMessage) => void;
+  /** Forwarded before the chat-level toast so call setup can roll back. */
+  onServerError?: (payload: ErrorPayload) => void;
 }
 
 function readClientId(message: MessageDto): string | null {
@@ -163,6 +170,8 @@ export function useChannelChat(options: UseChannelChatOptions) {
     initialMessages,
     firstChannelHref,
     onSendFailed,
+    onCallEvent,
+    onServerError,
   } = options;
 
   const router = useRouter();
@@ -195,10 +204,20 @@ export function useChannelChat(options: UseChannelChatOptions) {
     Map<string, { content: string; replyToId: number | null }>
   >(new Map());
   const onSendFailedRef = useRef(onSendFailed);
+  const onCallEventRef = useRef(onCallEvent);
+  const onServerErrorRef = useRef(onServerError);
 
   useEffect(() => {
     onSendFailedRef.current = onSendFailed;
   }, [onSendFailed]);
+
+  useEffect(() => {
+    onCallEventRef.current = onCallEvent;
+  }, [onCallEvent]);
+
+  useEffect(() => {
+    onServerErrorRef.current = onServerError;
+  }, [onServerError]);
 
   useEffect(() => {
     lastMessageIdRef.current = maxServerId(messages);
@@ -357,7 +376,12 @@ export function useChannelChat(options: UseChannelChatOptions) {
             }
           }
         },
+        onCallEvent: (message) => {
+          onCallEventRef.current?.(message);
+        },
         onOperationError: (payload) => {
+          onServerErrorRef.current?.(payload);
+
           if (payload.clientId) {
             markSendFailed(payload.clientId);
             if (payload.code === "RATE_LIMITED") {
@@ -568,6 +592,12 @@ export function useChannelChat(options: UseChannelChatOptions) {
     clientRef.current?.sendClientMessage({ type: "typing", channelId });
   }, [channelId]);
 
+  const sendClientMessage = useCallback(
+    (message: ClientMessage): boolean =>
+      clientRef.current?.sendClientMessage(message) ?? false,
+    [],
+  );
+
   const typingUserList = Array.from(typingUsers.values()).sort((left, right) =>
     left.username.localeCompare(right.username, "tr"),
   );
@@ -585,6 +615,7 @@ export function useChannelChat(options: UseChannelChatOptions) {
     deleteMessage,
     toggleReaction,
     notifyTyping,
+    sendClientMessage,
     pendingEdits,
     pendingDeletes,
   };

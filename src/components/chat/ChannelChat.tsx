@@ -1,8 +1,12 @@
 "use client";
 
+import type {
+  CallServerMessage,
+  ErrorPayload,
+} from "@shared/protocol";
 import type { MessageAuthor, MessageDto } from "@shared/types";
 import { MESSAGE_MAX_LENGTH } from "@shared/constants";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import {
   REALTIME_RECONNECTING_MESSAGE,
@@ -13,6 +17,12 @@ import {
   type SendFailure,
   type TypingUser,
 } from "@/lib/realtime/use-channel-chat";
+import {
+  useCall,
+  type CallController,
+} from "@/lib/webrtc/use-call";
+import { CallBar } from "./CallBar";
+import { CallPanel } from "./CallPanel";
 import { ChatHeader } from "./ChatHeader";
 import { MessageComposer, type ReplyTarget } from "./MessageComposer";
 import { MessageList } from "./MessageList";
@@ -52,6 +62,16 @@ export function ChannelChat({
     setDraft((current) => (current.trim().length === 0 ? failure.content : current));
   }, []);
 
+  // useChannelChat needs the call handlers and useCall needs the socket send
+  // function, so the controller is connected through a ref after commit.
+  const callControllerRef = useRef<CallController | null>(null);
+  const handleCallEvent = useCallback((message: CallServerMessage) => {
+    callControllerRef.current?.handleCallEvent(message);
+  }, []);
+  const handleCallServerError = useCallback((payload: ErrorPayload) => {
+    callControllerRef.current?.handleServerError(payload);
+  }, []);
+
   const chat = useChannelChat({
     serverId: server.id,
     channelId: channel.id,
@@ -59,7 +79,20 @@ export function ChannelChat({
     initialMessages,
     firstChannelHref,
     onSendFailed: handleSendFailed,
+    onCallEvent: handleCallEvent,
+    onServerError: handleCallServerError,
   });
+
+  const call = useCall({
+    channelId: channel.id,
+    currentUser: { id: currentUser.id, username: currentUser.username },
+    connectionState: chat.connectionState,
+    sendMessage: chat.sendClientMessage,
+  });
+
+  useEffect(() => {
+    callControllerRef.current = call;
+  }, [call]);
 
   const typingLabel = useMemo(
     () => formatTypingLabel(chat.typingUsers),
@@ -111,6 +144,14 @@ export function ChannelChat({
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-[color:var(--bg)]">
       <ChatHeader channelName={channel.name} memberCount={memberCount} />
+
+      <CallBar call={call} />
+      <CallPanel
+        localScreenStream={call.localScreenStream}
+        onStopScreenShare={call.stopScreenShare}
+        remoteParticipants={call.remoteParticipants}
+        remoteStreams={call.remoteStreams}
+      />
 
       <MessageList
         canInteract={chat.isOpen}

@@ -5,6 +5,7 @@ import {
   REALTIME_PATH,
   WS_CLOSE_AUTH,
   WS_CLOSE_FORBIDDEN,
+  type CallServerMessage,
   type ClientMessage,
   type ErrorPayload,
   type MessageReactionsPayload,
@@ -42,6 +43,7 @@ export interface ChannelRealtimeHandlers {
   onPresenceOffline?: (userId: string) => void;
   onWorkspaceChanged?: (payload: WorkspaceChangedPayload) => void;
   onOperationError?: (payload: ErrorPayload) => void;
+  onCallEvent?: (message: CallServerMessage) => void;
   onGapMessages?: (messages: MessageDto[]) => void;
   onFatalError?: (message: string) => void;
 }
@@ -246,6 +248,13 @@ export class ChannelRealtimeClient {
         break;
       case "workspace:changed":
         this.handlers.onWorkspaceChanged?.(message);
+        break;
+      case "call:peers":
+      case "call:peer-joined":
+      case "call:peer-left":
+      case "call:state":
+      case "call:signal":
+        this.handlers.onCallEvent?.(message);
         break;
       case "error":
         this.handlers.onOperationError?.(message);

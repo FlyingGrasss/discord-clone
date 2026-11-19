@@ -2,6 +2,9 @@ import { STATUS_CODES, type IncomingMessage, type Server as HttpServer } from "n
 import type { Duplex } from "node:stream";
 import WebSocket, { WebSocketServer, type RawData } from "ws";
 import {
+  CALL_MAX_PARTICIPANTS,
+  CALL_SIGNAL_MAX_CANDIDATE_LENGTH,
+  CALL_SIGNAL_MAX_SDP_LENGTH,
   PROTOCOL_VERSION,
   REACTION_EMOJIS,
   REALTIME_PATH,
@@ -15,7 +18,11 @@ import {
   WS_MAX_PAYLOAD_BYTES,
   WS_TYPING_THROTTLE_MS,
   WS_TYPING_TTL_MS,
+  callAvatarColor,
   isReactionEmoji,
+  type CallIceCandidate,
+  type CallPeer,
+  type CallSignalData,
   type ErrorPayload,
   type PublicUser,
   type ReactionGroup,
@@ -49,11 +56,21 @@ interface ConnectionState {
   isAlive: boolean;
   closing: boolean;
   removed: boolean;
+  /** Channel calls this socket joined; used for disconnect cleanup. */
+  callChannels: Set<string>;
 }
 
 interface PresenceEntry {
   user: PublicUser;
   connections: number;
+}
+
+interface CallMember {
+  user: PublicUser;
+  avatarColor: string;
+  muted: boolean;
+  screenSharing: boolean;
+  connections: Set<ConnectionState>;
 }
 
 interface ReactionRow {
@@ -108,6 +125,61 @@ function toMessageDto(row: MessageWithAuthorRow): MessageDto {
   };
 }
 
+function readChannelId(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > 128) return null;
+  return value;
+}
+
+function readCallSignalData(value: unknown): CallSignalData | null {
+  if (!isRecord(value)) return null;
+
+  if (value.kind === "offer" || value.kind === "answer") {
+    if (typeof value.sdp !== "string") return null;
+    if (value.sdp.length === 0 || value.sdp.length > CALL_SIGNAL_MAX_SDP_LENGTH) {
+      return null;
+    }
+    return { kind: value.kind, sdp: value.sdp };
+  }
+
+  if (value.kind !== "ice" || !isRecord(value.candidate)) return null;
+
+  const raw = value.candidate;
+  if (
+    typeof raw.candidate !== "string" ||
+    raw.candidate.length > CALL_SIGNAL_MAX_CANDIDATE_LENGTH
+  ) {
+    return null;
+  }
+
+  const candidate: CallIceCandidate = { candidate: raw.candidate };
+  if (typeof raw.sdpMid === "string" && raw.sdpMid.length <= 256) {
+    candidate.sdpMid = raw.sdpMid;
+  } else if (raw.sdpMid === null) {
+    candidate.sdpMid = null;
+  }
+
+  if (
+    typeof raw.sdpMLineIndex === "number" &&
+    Number.isInteger(raw.sdpMLineIndex) &&
+    raw.sdpMLineIndex >= 0 &&
+    raw.sdpMLineIndex <= 255
+  ) {
+    candidate.sdpMLineIndex = raw.sdpMLineIndex;
+  } else if (raw.sdpMLineIndex === null) {
+    candidate.sdpMLineIndex = null;
+  }
+
+  if (typeof raw.usernameFragment === "string" && raw.usernameFragment.length <= 256) {
+    candidate.usernameFragment = raw.usernameFragment;
+  } else if (raw.usernameFragment === null) {
+    candidate.usernameFragment = null;
+  }
+
+  return { kind: "ice", candidate };
+}
+
 function rejectUpgrade(
   socket: Duplex,
   status: number,
@@ -147,7 +219,9 @@ export function attachRealtime(ctx: AppContext, httpServer: HttpServer): Realtim
   const userConnections = new Map<string, Set<ConnectionState>>();
   const presence = new Map<string, Map<string, PresenceEntry>>();
   const typingThrottle = new Map<string, number>();
+  const calls = new Map<string, Map<string, CallMember>>();
   const messageLimiter = new TokenBucketRateLimiter(5, 1_000);
+  const callSignalLimiter = new TokenBucketRateLimiter(120, 1_000);
 
   let disposed = false;
 
@@ -275,6 +349,57 @@ export function attachRealtime(ctx: AppContext, httpServer: HttpServer): Realtim
       channelId,
       reactions: listReactions(messageId),
     });
+  };
+
+  const toCallPeer = (member: CallMember): CallPeer => ({
+    userId: member.user.id,
+    username: member.user.username,
+    avatarColor: member.avatarColor,
+    screenSharing: member.screenSharing,
+  });
+
+  /** Sends only to sockets that joined this channel's call. */
+  const broadcastCall = (
+    channelId: string,
+    message: ServerMessage,
+    except?: ConnectionState,
+  ): void => {
+    const members = calls.get(channelId);
+    if (!members || members.size === 0) return;
+
+    const payload = JSON.stringify(message);
+    for (const member of members.values()) {
+      for (const state of member.connections) {
+        if (state === except) continue;
+        sendRaw(state, payload);
+      }
+    }
+  };
+
+  const removeCallMember = (
+    state: ConnectionState,
+    channelId: string,
+    notify: boolean,
+  ): void => {
+    state.callChannels.delete(channelId);
+
+    const members = calls.get(channelId);
+    if (!members) return;
+
+    const member = members.get(state.userId);
+    if (!member || !member.connections.delete(state)) return;
+    if (member.connections.size > 0) return;
+
+    members.delete(state.userId);
+    if (members.size === 0) calls.delete(channelId);
+
+    if (notify && !disposed) {
+      broadcastCall(channelId, {
+        type: "call:peer-left",
+        channelId,
+        userId: state.userId,
+      });
+    }
   };
 
   const requireChannel = (
@@ -520,6 +645,209 @@ export function attachRealtime(ctx: AppContext, httpServer: HttpServer): Realtim
     send(state, { type: "pong", t: message.t });
   };
 
+  const handleCallJoin = (
+    state: ConnectionState,
+    message: Record<string, unknown>,
+  ): void => {
+    const channelId = readChannelId(message.channelId);
+    if (channelId === null) {
+      sendError(state, "VALIDATION_ERROR", "Kanal kimliği gerekli.");
+      return;
+    }
+
+    try {
+      requireChannel(state, channelId);
+    } catch (error) {
+      sendApiFailure(state, error);
+      return;
+    }
+
+    let members = calls.get(channelId);
+    if (!members) {
+      members = new Map();
+      calls.set(channelId, members);
+    }
+
+    let member = members.get(state.userId);
+    let added = false;
+
+    if (!member) {
+      if (members.size >= CALL_MAX_PARTICIPANTS) {
+        sendError(state, "CALL_FULL", "Görüşme dolu (en fazla 5 kişi).");
+        return;
+      }
+
+      member = {
+        user: state.user,
+        avatarColor: callAvatarColor(state.userId),
+        muted: false,
+        screenSharing: false,
+        connections: new Set(),
+      };
+      members.set(state.userId, member);
+      added = true;
+    }
+
+    member.connections.add(state);
+    state.callChannels.add(channelId);
+
+    const peers: CallPeer[] = [];
+    for (const other of members.values()) {
+      if (other.user.id === state.userId) continue;
+      peers.push(toCallPeer(other));
+    }
+
+    send(state, { type: "call:peers", channelId, peers });
+
+    // Mute state is not part of the peer list, so hydrate it explicitly for
+    // late joiners; screen sharing is already on the peer entry.
+    for (const other of members.values()) {
+      if (other.user.id === state.userId) continue;
+      send(state, {
+        type: "call:state",
+        channelId,
+        userId: other.user.id,
+        muted: other.muted,
+        screenSharing: other.screenSharing,
+      });
+    }
+
+    if (added) {
+      broadcastCall(
+        channelId,
+        { type: "call:peer-joined", channelId, user: toCallPeer(member) },
+        state,
+      );
+    }
+  };
+
+  const handleCallLeave = (
+    state: ConnectionState,
+    message: Record<string, unknown>,
+  ): void => {
+    const channelId = readChannelId(message.channelId);
+    if (channelId === null) {
+      sendError(state, "VALIDATION_ERROR", "Kanal kimliği gerekli.");
+      return;
+    }
+
+    // Leaving must still work if membership was revoked while connected.
+    removeCallMember(state, channelId, true);
+  };
+
+  const handleCallState = (
+    state: ConnectionState,
+    message: Record<string, unknown>,
+  ): void => {
+    const channelId = readChannelId(message.channelId);
+    if (channelId === null) {
+      sendError(state, "VALIDATION_ERROR", "Kanal kimliği gerekli.");
+      return;
+    }
+
+    if (
+      typeof message.muted !== "boolean" ||
+      typeof message.screenSharing !== "boolean"
+    ) {
+      sendError(state, "VALIDATION_ERROR", "Görüşme durumu geçersiz.");
+      return;
+    }
+
+    try {
+      requireChannel(state, channelId);
+    } catch (error) {
+      sendApiFailure(state, error);
+      return;
+    }
+
+    const member = calls.get(channelId)?.get(state.userId);
+    if (!member) {
+      sendError(state, "VALIDATION_ERROR", "Önce görüşmeye katıl.");
+      return;
+    }
+
+    member.muted = message.muted;
+    member.screenSharing = message.screenSharing;
+
+    broadcastCall(channelId, {
+      type: "call:state",
+      channelId,
+      userId: state.userId,
+      muted: member.muted,
+      screenSharing: member.screenSharing,
+    });
+  };
+
+  const handleCallSignal = (
+    state: ConnectionState,
+    message: Record<string, unknown>,
+  ): void => {
+    const channelId = readChannelId(message.channelId);
+    if (channelId === null) {
+      sendError(state, "VALIDATION_ERROR", "Kanal kimliği gerekli.");
+      return;
+    }
+
+    const toUserId =
+      typeof message.toUserId === "string" ? message.toUserId.trim() : "";
+    if (toUserId.length === 0 || toUserId.length > 128) {
+      sendError(state, "VALIDATION_ERROR", "Sinyal hedefi geçersiz.");
+      return;
+    }
+
+    const data = readCallSignalData(message.data);
+    if (!data) {
+      sendError(state, "VALIDATION_ERROR", "Ses sinyali geçersiz.");
+      return;
+    }
+
+    try {
+      requireChannel(state, channelId);
+    } catch (error) {
+      sendApiFailure(state, error);
+      return;
+    }
+
+    const members = calls.get(channelId);
+    if (!members?.has(state.userId)) {
+      sendError(state, "VALIDATION_ERROR", "Önce görüşmeye katıl.");
+      return;
+    }
+
+    if (toUserId === state.userId) return;
+
+    const target = members.get(toUserId);
+    if (!target) {
+      sendError(state, "VALIDATION_ERROR", "Sinyal hedefi görüşmede değil.");
+      return;
+    }
+
+    // A hostile peer must not be able to turn signaling into a broadcast
+    // amplifier. Excess candidates are dropped rather than closing the socket.
+    if (!callSignalLimiter.take(state.userId).allowed) return;
+
+    const relay: ServerMessage =
+      data.kind === "ice"
+        ? {
+            type: "call:signal",
+            channelId,
+            fromUserId: state.userId,
+            kind: "ice",
+            candidate: data.candidate,
+          }
+        : {
+            type: "call:signal",
+            channelId,
+            fromUserId: state.userId,
+            kind: data.kind,
+            sdp: data.sdp,
+          };
+
+    for (const targetState of target.connections) {
+      send(targetState, relay);
+    }
+  };
+
   const handleClientMessage = (
     state: ConnectionState,
     message: Record<string, unknown>,
@@ -540,6 +868,18 @@ export function attachRealtime(ctx: AppContext, httpServer: HttpServer): Realtim
       case "typing":
         handleTyping(state, message);
         break;
+      case "call:join":
+        handleCallJoin(state, message);
+        break;
+      case "call:leave":
+        handleCallLeave(state, message);
+        break;
+      case "call:signal":
+        handleCallSignal(state, message);
+        break;
+      case "call:state":
+        handleCallState(state, message);
+        break;
       case "ping":
         handlePing(state, message);
         break;
@@ -552,6 +892,11 @@ export function attachRealtime(ctx: AppContext, httpServer: HttpServer): Realtim
   const cleanup = (state: ConnectionState): void => {
     if (state.removed) return;
     state.removed = true;
+
+    // Drop the socket from every voice call before the early returns below.
+    for (const channelId of [...state.callChannels]) {
+      removeCallMember(state, channelId, true);
+    }
 
     connections.delete(state);
 
@@ -667,6 +1012,7 @@ export function attachRealtime(ctx: AppContext, httpServer: HttpServer): Realtim
       isAlive: true,
       closing: false,
       removed: false,
+      callChannels: new Set(),
     };
 
     connections.add(state);
@@ -905,6 +1251,7 @@ export function attachRealtime(ctx: AppContext, httpServer: HttpServer): Realtim
       unsubscribeNew();
       unsubscribeUpdated();
       unsubscribeDeleted();
+      calls.clear();
 
       const socketClosed = [...connections].map(
         (state) =>

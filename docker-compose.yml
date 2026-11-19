@@ -18,7 +18,8 @@ services:
       APP_ORIGINS: "${APP_ORIGINS:?Set APP_ORIGINS to the public web origin}"
       TRUST_PROXY: "${TRUST_PROXY:-}"
     ports:
-      - "3000:3000"
+      - "${HOST_PORT:-3000}:3000"
+      - "${WS_HOST_PORT:-4300}:4300"
     expose:
       # API/WebSocket port for a reverse proxy on the same Docker network.
       - "4300"
