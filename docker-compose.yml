@@ -1,0 +1,53 @@
+name: discord-clone
+
+services:
+  app:
+    build:
+      context: .
+      args:
+        # Build-time only. Use 443 when Caddy/another proxy routes /ws to the
+        # API container; use 4300 when the WebSocket port is published directly.
+        NEXT_PUBLIC_REALTIME_PORT: "${NEXT_PUBLIC_REALTIME_PORT:-4300}"
+    image: discord-clone:latest
+    environment:
+      NODE_ENV: production
+      API_PORT: "4300"
+      # Must listen beyond loopback so a proxy container can reach the WebSocket.
+      API_HOST: "0.0.0.0"
+      # Required: public web origin, e.g. https://chat.example.com
+      APP_ORIGINS: "${APP_ORIGINS:?Set APP_ORIGINS to the public web origin}"
+      TRUST_PROXY: "${TRUST_PROXY:-}"
+    ports:
+      - "3000:3000"
+    expose:
+      # API/WebSocket port for a reverse proxy on the same Docker network.
+      - "4300"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    stop_grace_period: 20s
+    healthcheck:
+      # Next proxies /api/* to 127.0.0.1:4300 inside the container.
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+# Reverse proxy example (Caddy). Recommended: build with
+# NEXT_PUBLIC_REALTIME_PORT=443 and route both web and WebSocket through 443.
+#
+# chat.example.com {
+#     encode zstd gzip
+#     handle /ws* {
+#         reverse_proxy app:4300
+#     }
+#     reverse_proxy app:3000
+# }
+#
+# Next.js rewrites proxy HTTP but not WebSocket upgrades, so /ws must go
+# directly to the API container. If the proxy runs on the host instead of the
+# Compose network, publish 4300:4300 and build with the default port 4300.
+# Set APP_ORIGINS=https://chat.example.com and TRUST_PROXY=1 in .env.
+# On Linux, make the bind mount writable by UID 1000 before the first start:
+#   mkdir -p data && sudo chown -R 1000:1000 data

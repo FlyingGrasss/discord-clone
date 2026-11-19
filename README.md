@@ -39,3 +39,26 @@ pnpm seed       # demo sunucu: RavenMUN, kullanıcı: elif / demo1234
 
 - Tek süreç: SQLite tek yazıcı, bellek içi rate limit / presence. Ölçek için Postgres + Redis gerekir.
 - Sesli/görüntülü, DM, rol/yetki, dosya yükleme ve moderasyon v2'de.
+
+## Docker ile dağıtım
+
+Depoda `Dockerfile`, `.dockerignore`, `docker-compose.yml` ve `scripts/start.sh` var. İmaj Next.js'i derler; aynı konteynerde `tsx` ile API/WebSocket (4300) ve `next start` (3000) çalışır. Süreçler root olmayan `node` kullanıcısı (UID 1000) ile çalışır, `NODE_ENV=production` sabittir ve imaja secret gömülmez.
+
+```bash
+cat > .env <<'EOF'
+APP_ORIGINS=https://chat.example.com
+NEXT_PUBLIC_REALTIME_PORT=443
+TRUST_PROXY=1
+EOF
+
+docker compose up -d --build
+docker compose logs -f app
+```
+
+- Yayınlanan port: yalnızca `3000`. API/WebSocket `4300` yalnızca Compose ağına `expose` edilir.
+- Zorunlu: `APP_ORIGINS` (public web origin). `NEXT_PUBLIC_REALTIME_PORT` derleme zamanındadır; varsayılan `4300`, TLS proxy arkasında `/ws` yönlendirilecekse `443` kullanın. Değiştirdikten sonra yeniden derleyin.
+- Next.js `/api/*` isteklerini proxy'ler ama WebSocket upgrade'lerini proxy'lemez. Ters proxy `/ws` yolunu doğrudan `app:4300`'e yönlendirmeli; proxy host'ta çalışıyorsa `4300:4300` portunu yayınlayın ve varsayılan derleme portunu kullanın. `docker-compose.yml` içinde Caddy örneği yorum olarak duruyor.
+- Kalıcılık: `./data` host dizini `/app/data`'ya bağlanır (`meydan.db`, `-wal`, `-shm`). Linux'ta önce `mkdir -p data && sudo chown -R 1000:1000 data`.
+- Health check: `GET /api/health` (3000 üzerinden Next rewrite ile 4300'e gider).
+- `scripts/start.sh` her açılışta `tsx server/seed.ts --if-empty` çalıştırır. Boş veritabanında `demo1234` parolalı demo hesaplar oluşur; public dağıtımda ilk açılıştan sonra seed adımını kaldırın veya parolaları değiştirin.
+- Tek instance: SQLite ve bellek içi presence/rate limit yatay ölçeklenmez. `docker compose down` veriyi silmez.
